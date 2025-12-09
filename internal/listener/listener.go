@@ -13,11 +13,13 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 // Listener 交易监听器
 type Listener struct {
 	client    *ethclient.Client
+	rpcClient *rpc.Client
 	wssURL    string
 	isRunning bool
 	mu        sync.RWMutex
@@ -32,8 +34,14 @@ func NewListener(wssURL string) (*Listener, error) {
 		return nil, fmt.Errorf("failed to connect to Ethereum node: %v", err)
 	}
 
+	rpcClient, err := rpc.Dial(wssURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to RPC endpoint: %v", err)
+	}
+
 	return &Listener{
 		client:    client,
+		rpcClient: rpcClient,
 		wssURL:    wssURL,
 		isRunning: false,
 		txCount:   0,
@@ -58,7 +66,7 @@ func (l *Listener) Start(ctx context.Context, txChan chan<- *types.Transaction) 
 	headChan := make(chan *ethtypes.Header, 100)
 
 	// 订阅新区块
-	sub, err := l.client.SubscribeNewHead(ctx, headChan)
+	headSub, err := l.client.SubscribeNewHead(ctx, headChan)
 	if err != nil {
 		l.mu.Lock()
 		l.isRunning = false
@@ -69,9 +77,12 @@ func (l *Listener) Start(ctx context.Context, txChan chan<- *types.Transaction) 
 	// 启动区块处理goroutine
 	go l.processHeads(ctx, headChan, txChan)
 
+	// 启动pending交易监听goroutine
+	go l.subscribePendingTransactions(ctx, txChan)
+
 	// 处理订阅事件
 	go func() {
-		defer sub.Unsubscribe()
+		defer headSub.Unsubscribe()
 
 		for {
 			select {
@@ -81,8 +92,8 @@ func (l *Listener) Start(ctx context.Context, txChan chan<- *types.Transaction) 
 				l.isRunning = false
 				l.mu.Unlock()
 				return
-			case err := <-sub.Err():
-				log.Printf("⚠️ 订阅错误: %v", err)
+			case err := <-headSub.Err():
+				log.Printf("⚠️ 新区块订阅错误: %v", err)
 				// 尝试重新连接
 				go l.reconnect(ctx, txChan)
 				return
@@ -91,6 +102,45 @@ func (l *Listener) Start(ctx context.Context, txChan chan<- *types.Transaction) 
 	}()
 
 	return nil
+}
+
+// subscribePendingTransactions 订阅pending交易
+func (l *Listener) subscribePendingTransactions(ctx context.Context, txChan chan<- *types.Transaction) {
+	// 使用rpc客户端订阅pending交易
+	pendingTxChan := make(chan string, 1000)
+
+	sub, err := l.rpcClient.EthSubscribe(ctx, pendingTxChan, "newPendingTransactions")
+	if err != nil {
+		log.Printf("❌ 无法订阅pending交易: %v", err)
+		return
+	}
+	defer sub.Unsubscribe()
+
+	log.Println("✅ 已成功订阅pending交易")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("🛑 Pending交易订阅收到停止信号")
+			return
+		case err := <-sub.Err():
+			log.Printf("⚠️ Pending交易订阅错误: %v", err)
+			return
+		case txHashStr := <-pendingTxChan:
+			if txHashStr == "" {
+				continue
+			}
+
+			// 将字符串转换为Hash
+			txHash := common.HexToHash(txHashStr)
+
+			// 打印pending交易日志
+			log.Printf("[PENDING] 收到交易: %s", txHash.Hex())
+
+			// 异步处理交易
+			go l.fetchAndProcessTransaction(ctx, txHash, txChan)
+		}
+	}
 }
 
 // processHeads 处理新区块
@@ -112,15 +162,8 @@ func (l *Listener) processHeads(ctx context.Context, headChan <-chan *ethtypes.H
 
 // fetchPendingTransactions 获取pending transactions
 func (l *Listener) fetchPendingTransactions(ctx context.Context, blockNumber *big.Int, txChan chan<- *types.Transaction) {
-	// 简化实现：直接获取当前pending transactions
-	// 实际项目中可能需要更复杂的逻辑来监听内存池
-
-	// 这里可以添加获取pending transactions的逻辑
-	// 由于ethclient没有直接的方法，可以使用其他方式
-	// 例如通过JSON-RPC调用eth_pendingTransactions
-
 	log.Printf("📦 新区块到达: %s", blockNumber.String())
-	// 暂时不实现具体的pending transactions获取逻辑
+	// 现在有了SubscribePendingTransactions，此函数主要用于区块到达时的处理
 }
 
 // fetchAndProcessTransaction 获取并处理交易
@@ -166,8 +209,24 @@ func (l *Listener) fetchAndProcessTransaction(ctx context.Context, txHash common
 			// 发送到处理通道
 			select {
 			case txChan <- transaction:
-				// 统计信息
-				if l.txCount%1000 == 0 {
+				// 更新交易计数
+				l.mu.Lock()
+				l.txCount++
+				l.mu.Unlock()
+
+				// 打印处理成功的日志
+				toAddress := "合约创建"
+				if transaction.To != nil {
+					toAddress = transaction.To.Hex()[:10] + "..."
+				}
+				log.Printf("[PENDING] 处理成功: %s (From: %s, To: %s, Value: %s ETH)",
+					txHash.Hex()[:10]+"...",
+					transaction.From.Hex()[:10]+"...",
+					toAddress,
+					transaction.Value.String())
+
+				// 统计信息（每100笔交易打印一次）
+				if l.txCount%100 == 0 {
 					l.logStats()
 				}
 			case <-ctx.Done():
@@ -255,6 +314,9 @@ func (l *Listener) Stop() {
 		l.isRunning = false
 		if l.client != nil {
 			l.client.Close()
+		}
+		if l.rpcClient != nil {
+			l.rpcClient.Close()
 		}
 		log.Println("🛑 监听器已停止")
 	}

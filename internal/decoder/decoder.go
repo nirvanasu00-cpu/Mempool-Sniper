@@ -30,16 +30,16 @@ func NewDecoder() *Decoder {
 }
 
 // StartWorkerPool 启动解码器工作池
-func (d *Decoder) StartWorkerPool(ctx context.Context, txChan <-chan *types.Transaction, workerCount int) {
+func (d *Decoder) StartWorkerPool(ctx context.Context, txChan <-chan *types.Transaction, decodedTxChan chan<- *types.DecodedTransaction, workerCount int) {
 	log.Printf("🔍 启动解码器工作池，工作线程数: %d", workerCount)
 
 	for i := 0; i < workerCount; i++ {
-		go d.worker(ctx, txChan, i)
+		go d.worker(ctx, txChan, decodedTxChan, i)
 	}
 }
 
 // worker 解码器工作线程
-func (d *Decoder) worker(ctx context.Context, txChan <-chan *types.Transaction, workerID int) {
+func (d *Decoder) worker(ctx context.Context, txChan <-chan *types.Transaction, decodedTxChan chan<- *types.DecodedTransaction, workerID int) {
 	log.Printf("👷 解码器工作线程 %d 启动", workerID)
 
 	for {
@@ -59,12 +59,56 @@ func (d *Decoder) worker(ctx context.Context, txChan <-chan *types.Transaction, 
 			// 解码交易
 			decodedTx := d.decodeTransaction(tx)
 			if decodedTx != nil {
-				// 这里可以添加进一步的处理逻辑
-				// 例如发送到模拟器或记录日志
-				log.Printf("✅ 工作线程 %d 解码成功: %s -> %s",
-					workerID, tx.Hash.Hex(), decodedTx.Method)
+				// 🚨 猎物发现！输出醒目标志
+				d.logHuntingResult(decodedTx, workerID)
+
+				// 将解码后的交易发送到模拟器
+				select {
+				case decodedTxChan <- decodedTx:
+					log.Printf("✅ 工作线程 %d 解码成功并发送到模拟器: %s -> %s",
+						workerID, tx.Hash.Hex(), decodedTx.Method)
+				case <-ctx.Done():
+					return
+				default:
+					log.Printf("⚠️ 工作线程 %d 解码器通道已满，丢弃交易: %s", workerID, tx.Hash.Hex())
+				}
 			}
 		}
+	}
+}
+
+// logHuntingResult 记录猎物发现结果
+func (d *Decoder) logHuntingResult(decodedTx *types.DecodedTransaction, workerID int) {
+	if decodedTx.IsSwap {
+		// 根据交易方向输出不同的日志
+		switch decodedTx.SwapDirection {
+		case "buy":
+			log.Printf("🔥🔥🔥 [%s] 发现买单! 工作线程: %d",
+				GetDEXName(decodedTx.TargetContract), workerID)
+			log.Printf("💰 交易哈希: %s", decodedTx.Transaction.Hash.Hex())
+			log.Printf("🎯 投入金额: %s Wei (ETH)", decodedTx.Transaction.Value.String())
+			log.Printf("📊 方法: %s", decodedTx.Method)
+
+		case "sell":
+			log.Printf("🔥🔥🔥 [%s] 发现卖单! 工作线程: %d",
+				GetDEXName(decodedTx.TargetContract), workerID)
+			log.Printf("💰 交易哈希: %s", decodedTx.Transaction.Hash.Hex())
+			log.Printf("📊 方法: %s", decodedTx.Method)
+
+		case "swap":
+			log.Printf("🔥 [%s] 发现代币交换! 工作线程: %d",
+				GetDEXName(decodedTx.TargetContract), workerID)
+			log.Printf("💰 交易哈希: %s", decodedTx.Transaction.Hash.Hex())
+			log.Printf("📊 方法: %s", decodedTx.Method)
+		}
+
+		// 每10笔猎物交易打印一次统计信息
+		d.mu.RLock()
+		if d.decoded%10 == 0 {
+			log.Printf("📊 解码器统计 - 总处理: %d, 成功解码: %d, 成功率: %.2f%%",
+				d.processed, d.decoded, float64(d.decoded)/float64(d.processed)*100)
+		}
+		d.mu.RUnlock()
 	}
 }
 
@@ -217,6 +261,14 @@ func IsSwapMethod(methodID []byte) bool {
 		}
 	}
 	return false
+}
+
+// GetDEXName 根据合约地址获取DEX名称
+func GetDEXName(address common.Address) string {
+	if name, exists := SupportedDEX[address]; exists {
+		return name
+	}
+	return address.Hex()[:10] + "..."
 }
 
 // GetMethodName 根据方法ID获取方法名称

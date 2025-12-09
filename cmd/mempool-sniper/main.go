@@ -52,19 +52,20 @@ func main() {
 
 	// 创建交易通道和盈利分析通道
 	txChan := make(chan *types.Transaction, 100)
+	decodedTxChan := make(chan *types.DecodedTransaction, 100)
 	profitChan := make(chan *types.ProfitAnalysis, 100)
 
 	// 启动监听器
 	go listener.Start(ctx, txChan)
 
 	// 启动解码器工作池
-	go decoder.StartWorkerPool(ctx, txChan, 5)
+	go decoder.StartWorkerPool(ctx, txChan, decodedTxChan, 5)
 
 	// 启动模拟器工作池
-	go simulator.StartWorkerPool(ctx, profitChan, 3)
+	go simulator.StartWorkerPool(ctx, decodedTxChan, profitChan, 3)
 
 	// 启动结果处理器
-	go processResults(ctx, profitChan)
+	go processResults(ctx, profitChan, &cfg.Sniper)
 
 	log.Println("🚀 Mempool Sniper 启动成功")
 	log.Printf("📡 监听节点: %s", cfg.Ethereum.WSSURL)
@@ -93,13 +94,13 @@ func setupSignalHandler(cancel context.CancelFunc) {
 }
 
 // processResults 处理盈利分析结果
-func processResults(ctx context.Context, profitChan chan *types.ProfitAnalysis) {
+func processResults(ctx context.Context, profitChan chan *types.ProfitAnalysis, cfg *config.SniperConfig) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case analysis := <-profitChan:
-			if analysis != nil && analysis.Profit.Cmp(analysis.Config.MinProfit) >= 0 {
+			if analysis != nil && analysis.Profit.Cmp(cfg.MinProfit) >= 0 {
 				log.Printf("💰 发现盈利机会!")
 				log.Printf("  交易哈希: %s", analysis.TxHash.Hex())
 				log.Printf("  预估盈利: %s ETH", analysis.Profit.String())

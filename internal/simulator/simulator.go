@@ -45,16 +45,16 @@ func NewSimulator(rpcURL string) *Simulator {
 }
 
 // StartWorkerPool 启动模拟器工作池
-func (s *Simulator) StartWorkerPool(ctx context.Context, profitChan chan<- *types.ProfitAnalysis, workerCount int) {
+func (s *Simulator) StartWorkerPool(ctx context.Context, decodedTxChan <-chan *types.DecodedTransaction, profitChan chan<- *types.ProfitAnalysis, workerCount int) {
 	log.Printf("🔮 启动模拟器工作池，工作线程数: %d", workerCount)
 
 	for i := 0; i < workerCount; i++ {
-		go s.worker(ctx, profitChan, i)
+		go s.worker(ctx, decodedTxChan, profitChan, i)
 	}
 }
 
 // worker 模拟器工作线程
-func (s *Simulator) worker(ctx context.Context, profitChan chan<- *types.ProfitAnalysis, workerID int) {
+func (s *Simulator) worker(ctx context.Context, decodedTxChan <-chan *types.DecodedTransaction, profitChan chan<- *types.ProfitAnalysis, workerID int) {
 	log.Printf("👷 模拟器工作线程 %d 启动", workerID)
 
 	// 确保客户端连接
@@ -70,10 +70,25 @@ func (s *Simulator) worker(ctx context.Context, profitChan chan<- *types.ProfitA
 		case <-ctx.Done():
 			log.Printf("🛑 模拟器工作线程 %d 停止", workerID)
 			return
-		// 这里需要从解码器接收交易进行模拟
-		// 目前先保持空循环，等待后续集成
-		default:
-			time.Sleep(100 * time.Millisecond)
+		case decodedTx := <-decodedTxChan:
+			if decodedTx == nil {
+				continue
+			}
+
+			// 模拟交易执行
+			profitAnalysis := s.SimulateTransaction(ctx, decodedTx)
+			if profitAnalysis != nil {
+				// 将盈利分析结果发送到结果处理器
+				select {
+				case profitChan <- profitAnalysis:
+					log.Printf("💰 工作线程 %d 模拟完成并发送结果: %s -> 盈利 %s ETH",
+						workerID, decodedTx.Transaction.Hash.Hex(), profitAnalysis.NetProfit.String())
+				case <-ctx.Done():
+					return
+				default:
+					log.Printf("⚠️ 工作线程 %d 盈利通道已满，丢弃结果: %s", workerID, decodedTx.Transaction.Hash.Hex())
+				}
+			}
 		}
 	}
 }
