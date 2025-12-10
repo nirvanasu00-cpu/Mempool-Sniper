@@ -253,7 +253,3 @@ go test -bench=. ./internal/listener
 - 讨论交流: [GitHub Discussions](https://github.com/your-username/mempool-sniper/discussions)
 
 ---
-
-**键盘敲烂，月薪过万；代码跑通，马到成功！** 🚀
-
-搞不定了随时回来找我，这儿永远是你的"技术补给站"。去吧！
